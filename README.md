@@ -1,6 +1,6 @@
 # 冷库温度越限复盘 API
 
-基于 **Python 3.11 + FastAPI + Uvicorn** 的温度越限复盘与热暴露核算服务。输入同一冷库的一批
+基于 **Python 3.11 + FastAPI + Uvicorn** 的温度越限复盘、热暴露核算与双探头偏差复核服务。输入同一冷库的一批
 **带时区**温度读数、温度上限、最大采样间隔、最短报警时长与维护豁免时段，服务会：
 
 1. 校验读数时间**严格递增**、所有时间带时区、豁免时段合法（结束严格晚于开始）；
@@ -13,6 +13,10 @@
 另提供**货物存放窗口热暴露核算**（`POST /api/v1/cold-storage/exposure`）：复用同一套读数校验
 与断档规则，在存放窗口内精确积分 `max(温度−上限, 0)`（℃·秒）并与预算比对，详见下文。
 
+还提供**主、备双探头温度偏差复核**（`POST /api/v1/cold-storage/probes/deviation-review`）：
+接收同一冷库主、备两组带时区读数与各自的最大采样间隔，仅在两组覆盖时间的非空交集内按双方
+采样时刻切分、双侧线性插值，输出绝对温差超标的连续区间与断档未知区间，详见下文。
+
 ## 接口地址与端口
 
 | 项目 | 地址 |
@@ -20,6 +24,7 @@
 | 健康检查 | `GET http://localhost:8000/health` |
 | 复盘接口 | `POST http://localhost:8000/api/v1/cold-storage/alarms/review` |
 | 热暴露核算 | `POST http://localhost:8000/api/v1/cold-storage/exposure` |
+| 双探头偏差复核 | `POST http://localhost:8000/api/v1/cold-storage/probes/deviation-review` |
 | Swagger 文档 | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
 
@@ -45,8 +50,8 @@ HOST_PORT=18000 docker compose up --build   # 服务变为 http://localhost:1800
 ### 方式二：Docker
 
 ```bash
-docker build -t cold-storage-review-api:1.1.0 .
-docker run --rm -p 8000:8000 cold-storage-review-api:1.1.0
+docker build -t cold-storage-review-api:1.2.0 .
+docker run --rm -p 8000:8000 cold-storage-review-api:1.2.0
 ```
 
 ### 方式三：本地直接运行
@@ -215,18 +220,121 @@ curl -X POST http://localhost:8000/api/v1/cold-storage/exposure \
 }
 ```
 
+## 双探头温度偏差复核接口
+
+`POST /api/v1/cold-storage/probes/deviation-review` 接收同一冷库**主、备两个探头**各自的一组
+带时区读数、各自的最大采样间隔、允许温差与最短偏差时长，复用与复盘接口完全相同的读数校验和
+断档规则。
+
+计算规则：
+
+1. 仅在两组读数**覆盖时间的非空交集**内核算（覆盖时间取各自首末读数之间）；交集为空
+   （两组时间段不相交或仅端点相接）或其他参数无效时返回 `422`，**绝不外推**；
+2. 在交集内按**双方采样时刻**切分时间轴（任一侧的采样点都是切点），每个小段内两侧都至多落在
+   一条线性采样段上；
+3. 小段被**任一侧**的采样断档（相邻读数间隔严格超过其 `max_sample_gap_seconds`）覆盖时标记为
+   **未知区间**，不插值；偏差区间**不跨越**未知区间合并；
+4. 两侧均有效的小段上分别**线性插值**，差值是时间的线性函数，据此求出绝对温差
+   `|主 − 备|` **严格大于** `allowed_delta` 的连续区间（恰好等于不算偏差，穿越点由插值精确
+   计算，不必落在采样点上）；
+5. 连续偏差时长 `>= min_deviation_seconds` 才输出（阈值含等号）；
+6. 响应返回偏差区间、未知区间及各自的总时长，所有时间统一为 **UTC（`...Z`）**。
+
+请求体参数：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `primary.readings[]` | 读数 | 时间带时区、严格递增，至少 2 条 | 主探头读数 |
+| `primary.max_sample_gap_seconds` | number | `> 0` | 主探头最大相邻采样间隔（秒） |
+| `backup.readings[]` | 读数 | 时间带时区、严格递增，至少 2 条 | 备探头读数 |
+| `backup.max_sample_gap_seconds` | number | `> 0` | 备探头最大相邻采样间隔（秒） |
+| `allowed_delta` | number | `>= 0` 的有限数 | 允许温差（°C），绝对温差严格大于才算偏差 |
+| `min_deviation_seconds` | number | `>= 0` 的有限数 | 最短偏差时长（秒），达到才输出，含等号 |
+
+两组读数允许使用不同时区表示同一绝对时间（服务内部统一换算为 UTC）。
+
+请求示例：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/cold-storage/probes/deviation-review \
+  -H "Content-Type: application/json" \
+  -d '{
+    "primary": {
+      "readings": [
+        {"time": "2026-09-25T10:00:00+08:00", "temperature": -17.0},
+        {"time": "2026-09-25T10:01:00+08:00", "temperature": -17.0},
+        {"time": "2026-09-25T10:04:00+08:00", "temperature": -17.0},
+        {"time": "2026-09-25T10:10:00+08:00", "temperature": -16.0},
+        {"time": "2026-09-25T10:11:00+08:00", "temperature": -16.0},
+        {"time": "2026-09-25T10:12:00+08:00", "temperature": -16.0}
+      ],
+      "max_sample_gap_seconds": 120
+    },
+    "backup": {
+      "readings": [
+        {"time": "2026-09-25T02:00:00Z", "temperature": -18.5},
+        {"time": "2026-09-25T02:01:00Z", "temperature": -18.333333},
+        {"time": "2026-09-25T02:02:00Z", "temperature": -18.166667},
+        {"time": "2026-09-25T02:03:00Z", "temperature": -18.0},
+        {"time": "2026-09-25T02:04:00Z", "temperature": -17.833333},
+        {"time": "2026-09-25T02:05:00Z", "temperature": -17.666667},
+        {"time": "2026-09-25T02:06:00Z", "temperature": -17.5},
+        {"time": "2026-09-25T02:07:00Z", "temperature": -17.333333},
+        {"time": "2026-09-25T02:08:00Z", "temperature": -17.166667},
+        {"time": "2026-09-25T02:09:00Z", "temperature": -17.0},
+        {"time": "2026-09-25T02:10:00Z", "temperature": -16.833333},
+        {"time": "2026-09-25T02:11:00Z", "temperature": -16.666667},
+        {"time": "2026-09-25T02:12:00Z", "temperature": -16.5}
+      ],
+      "max_sample_gap_seconds": 120
+    },
+    "allowed_delta": 1.0,
+    "min_deviation_seconds": 30
+  }'
+```
+
+响应（时间已转 UTC；主探头 10:01→10:04 间隔 3 分钟超过 120 秒，交集内 540 秒标为未知、
+两侧偏差不跨越合并；起始段绝对温差 1.5→1.166… 严格大于 1°C，输出 60 秒偏差区间）：
+
+```json
+{
+  "deviation_intervals": [
+    {
+      "start": "2026-09-25T02:00:00Z",
+      "end": "2026-09-25T02:01:00Z",
+      "duration_seconds": 60.0
+    }
+  ],
+  "unknown_intervals": [
+    {
+      "start": "2026-09-25T02:01:00Z",
+      "end": "2026-09-25T02:10:00Z",
+      "duration_seconds": 540.0
+    }
+  ],
+  "deviation_seconds": 60.0,
+  "unknown_seconds": 540.0,
+  "deviation_count": 1,
+  "unknown_count": 1
+}
+```
+
+- `deviation_intervals`：达到最短偏差时长的连续偏差区间；
+- `unknown_intervals`：交集内任一侧采样断档覆盖的未知区间（交集外不外推，故只包含交集部分）。
+
 ## 项目结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py       # FastAPI 路由与启动入口（复盘 + 热暴露两个接口）
-│   ├── review.py     # 插值 / 断档 / 豁免扣减 / 时长筛选核心算法（公共校验与断档判定）
-│   ├── exposure.py   # 存放窗口热暴露精确积分、跨段累计与段内达标求解
-│   └── schemas.py    # 请求与响应模型（Pydantic 校验）
-├── tests/            # 算法层与 API 层测试（pytest）
-├── entrypoint.sh     # 单条启动命令：装依赖 + 初始化 + 起服务
+│   ├── main.py              # FastAPI 路由与启动入口（复盘 / 热暴露 / 双探头偏差三个接口）
+│   ├── review.py            # 插值 / 断档 / 豁免扣减 / 时长筛选核心算法（公共校验与断档判定）
+│   ├── exposure.py          # 存放窗口热暴露精确积分、跨段累计与段内达标求解
+│   ├── probe_deviation.py   # 双探头交集内切分、双侧插值求温差超标区间、断档未知不跨越
+│   └── schemas.py           # 请求与响应模型（Pydantic 校验）
+├── tests/                   # 算法层与 API 层测试（pytest）
+├── entrypoint.sh            # 单条启动命令：装依赖 + 初始化 + 起服务
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

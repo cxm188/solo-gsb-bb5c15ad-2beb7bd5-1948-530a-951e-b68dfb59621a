@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from app import exposure as exposure_logic
+from app import probe_deviation as probe_deviation_logic
 from app import review as review_logic
 from app.schemas import (
     AlarmReviewRequest,
@@ -20,17 +21,21 @@ from app.schemas import (
     ExposureRequest,
     ExposureResponse,
     IntervalOut,
+    ProbeDeviationRequest,
+    ProbeDeviationResponse,
 )
 
 app = FastAPI(
     title="冷库温度越限复盘 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "接收同一冷库的带时区温度读数及阈值配置，在允许的相邻读数间线性插值，"
         "计算超过温度上限的连续区间；采样断档标记为未知且不跨越；"
         "扣除维护豁免时段后按最短报警时长筛选报警。"
         "另提供货物存放窗口热暴露核算：窗口内精确积分 max(温度−上限, 0)，"
         "跨段累计并求解已知累计量首次达到预算的时刻。"
+        "以及主、备双探头温度偏差复核：仅在两组读数覆盖时间的非空交集内"
+        "按双方采样时刻切分、双侧线性插值，输出绝对温差超标区间与未知区间。"
     ),
 )
 
@@ -136,6 +141,55 @@ def compute_exposure(payload: ExposureRequest) -> ExposureResponse:
             else None
         ),
         status=result.status,
+    )
+
+
+@app.post(
+    "/api/v1/cold-storage/probes/deviation-review",
+    response_model=ProbeDeviationResponse,
+    tags=["双探头温度偏差复核"],
+    responses={422: {"description": "参数无效或两组读数覆盖时间无非空交集"}},
+)
+def review_probe_deviation(
+    payload: ProbeDeviationRequest,
+) -> ProbeDeviationResponse:
+    """复核同一冷库主、备探头的温度偏差。
+
+    - 两组读数时间均必须带时区且严格递增，否则返回 422；
+    - 仅在两组读数覆盖时间的**非空交集**内核算，无交集（含仅端点相接）返回 422；
+    - 按双方采样时刻切分时间轴；任一侧相邻读数间隔超过其
+      ``max_sample_gap_seconds`` 的交集部分标记为未知区间，**不外推**，
+      偏差区间**不跨越**未知区间合并；
+    - 两侧均有效的段上分别线性插值，求绝对温差**严格大于** ``allowed_delta``
+      的连续区间，持续时长 ``>= min_deviation_seconds`` 才输出；
+    - 响应中的区间与总时长统一为 UTC。
+    """
+    primary = [(r.time, r.temperature) for r in payload.primary.readings]
+    backup = [(r.time, r.temperature) for r in payload.backup.readings]
+
+    try:
+        result = probe_deviation_logic.probe_deviation(
+            primary=primary,
+            backup=backup,
+            max_sample_gap_seconds_primary=payload.primary.max_sample_gap_seconds,
+            max_sample_gap_seconds_backup=payload.backup.max_sample_gap_seconds,
+            allowed_delta=payload.allowed_delta,
+            min_deviation_seconds=payload.min_deviation_seconds,
+        )
+    except review_logic.ReviewError as exc:
+        # 覆盖时间无交集等语义错误统一返回 422（与 schema 校验失败一致）。
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    deviations = [_to_out(iv) for iv in result.deviation_intervals]
+    unknowns = [_to_out(iv) for iv in result.unknown_intervals]
+
+    return ProbeDeviationResponse(
+        deviation_intervals=deviations,
+        unknown_intervals=unknowns,
+        deviation_seconds=round(result.deviation_seconds, 6),
+        unknown_seconds=round(result.unknown_seconds, 6),
+        deviation_count=len(deviations),
+        unknown_count=len(unknowns),
     )
 
 

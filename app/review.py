@@ -80,23 +80,13 @@ class ReviewResult:
 # ---------------------------------------------------------------------------
 
 
-def prepare_readings(
-    readings: list[tuple[datetime, float]],
-    limit: float,
-    max_sample_gap_seconds: float,
-) -> list[Reading]:
-    """校验公共参数并解析读数。
+def parse_readings(readings: list[tuple[datetime, float]]) -> list[Reading]:
+    """校验读数本身并解析为内部结构。
 
-    - 温度上限必须是有限数值；
-    - 最大采样间隔必须为正数；
     - 至少需要 2 条读数，且温度均为有限数值（拒绝 NaN/Infinity）。
 
     调用方需保证读数时间带时区且严格递增（API 层由 schema 校验）。
     """
-    if not _is_finite(limit):
-        raise ReviewError("温度上限必须是有限数值")
-    if max_sample_gap_seconds <= 0:
-        raise ReviewError("最大采样间隔必须为正数")
     if len(readings) < 2:
         raise ReviewError("至少需要 2 条读数")
     pts = [Reading(_ts(t), float(temp)) for t, temp in readings]
@@ -104,6 +94,26 @@ def prepare_readings(
         if not _is_finite(p.temp):
             raise ReviewError("温度读数必须是有限数值（不接受 NaN/Infinity）")
     return pts
+
+
+def prepare_readings(
+    readings: list[tuple[datetime, float]],
+    limit: float,
+    max_sample_gap_seconds: float,
+) -> list[Reading]:
+    """校验公共参数并解析读数（复盘 / 热暴露共用）。
+
+    - 温度上限必须是有限数值；
+    - 最大采样间隔必须为正数；
+    - 读数本身的校验见 :func:`parse_readings`。
+
+    调用方需保证读数时间带时区且严格递增（API 层由 schema 校验）。
+    """
+    if not _is_finite(limit):
+        raise ReviewError("温度上限必须是有限数值")
+    if max_sample_gap_seconds <= 0:
+        raise ReviewError("最大采样间隔必须为正数")
+    return parse_readings(readings)
 
 
 def is_sample_gap(a: Reading, b: Reading, max_sample_gap_seconds: float) -> bool:
@@ -144,8 +154,8 @@ def _subtract_intervals(
     return result
 
 
-def _merge_exemptions(raw: list[Interval]) -> list[Interval]:
-    """合并重叠/相接的豁免时段。"""
+def _merge_intervals(raw: list[Interval]) -> list[Interval]:
+    """合并有序的半开区间中重叠/相接（touch）的部分。"""
     if not raw:
         return []
     ordered = sorted(raw, key=lambda iv: iv.start)
@@ -157,6 +167,11 @@ def _merge_exemptions(raw: list[Interval]) -> list[Interval]:
         else:
             merged.append(iv)
     return merged
+
+
+def _merge_exemptions(raw: list[Interval]) -> list[Interval]:
+    """合并重叠/相接的豁免时段。"""
+    return _merge_intervals(raw)
 
 
 # ---------------------------------------------------------------------------
