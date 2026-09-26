@@ -80,20 +80,40 @@ class ReviewResult:
 # ---------------------------------------------------------------------------
 
 
+def ensure_reading_times(times: list[datetime]) -> None:
+    """检查读数时间全部带时区且严格递增（空列表直接通过）。
+
+    越限复盘 / 热暴露 / 双探头偏差复核的 schema 层共用本校验；
+    缺时区抛 :class:`ValueError`，非严格递增抛 :class:`ReviewError`
+    （后者也是 ValueError 子类，Pydantic 同样按 422 处理）。
+    """
+    if not times:
+        return
+    for t in times:
+        if t.tzinfo is None:
+            raise ValueError("每条读数的 time 都必须带时区")
+    prev = times[0]
+    for t in times[1:]:
+        if t <= prev:
+            raise ReviewError("读数时间必须严格递增")
+        prev = t
+
+
 def prepare_readings(
     readings: list[tuple[datetime, float]],
-    limit: float,
     max_sample_gap_seconds: float,
+    limit: float | None = None,
 ) -> list[Reading]:
     """校验公共参数并解析读数。
 
-    - 温度上限必须是有限数值；
     - 最大采样间隔必须为正数；
-    - 至少需要 2 条读数，且温度均为有限数值（拒绝 NaN/Infinity）。
+    - 至少需要 2 条读数，且温度均为有限数值（拒绝 NaN/Infinity）；
+    - ``limit`` 给定时必须是有限数值（双探头偏差复核没有温度上限，可不传）。
 
-    调用方需保证读数时间带时区且严格递增（API 层由 schema 校验）。
+    调用方需保证读数时间带时区且严格递增（API 层由 schema 校验，
+    也可先用 :func:`ensure_reading_times` 检查）。
     """
-    if not _is_finite(limit):
+    if limit is not None and not _is_finite(limit):
         raise ReviewError("温度上限必须是有限数值")
     if max_sample_gap_seconds <= 0:
         raise ReviewError("最大采样间隔必须为正数")
@@ -144,8 +164,8 @@ def _subtract_intervals(
     return result
 
 
-def _merge_exemptions(raw: list[Interval]) -> list[Interval]:
-    """合并重叠/相接的豁免时段。"""
+def _merge_intervals(raw: list[Interval]) -> list[Interval]:
+    """合并重叠/相接的有序区间（豁免时段、未知区间等共用）。"""
     if not raw:
         return []
     ordered = sorted(raw, key=lambda iv: iv.start)
@@ -157,6 +177,11 @@ def _merge_exemptions(raw: list[Interval]) -> list[Interval]:
         else:
             merged.append(iv)
     return merged
+
+
+def _merge_exemptions(raw: list[Interval]) -> list[Interval]:
+    """合并重叠/相接的豁免时段。"""
+    return _merge_intervals(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +273,11 @@ def review(
     """
     if min_alarm_seconds < 0:
         raise ReviewError("最短报警时长不能为负数")
-    pts = prepare_readings(readings, limit, max_sample_gap_seconds)
+    pts = prepare_readings(
+        readings,
+        limit=limit,
+        max_sample_gap_seconds=max_sample_gap_seconds,
+    )
 
     raw_ex: list[Interval] = []
     for start, end in exemptions or []:

@@ -136,7 +136,11 @@ def exposure(
     """
     if not _is_finite(budget) or budget <= 0:
         raise ReviewError("热暴露预算必须是正的有限数值")
-    pts = prepare_readings(readings, limit, max_sample_gap_seconds)
+    pts = prepare_readings(
+        readings,
+        limit=limit,
+        max_sample_gap_seconds=max_sample_gap_seconds,
+    )
 
     ws, we = _ts(window[0]), _ts(window[1])
     if we <= ws + _EPS:

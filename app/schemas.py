@@ -15,6 +15,16 @@ class TemperatureReading(BaseModel):
     temperature: float = Field(..., description="冷库温度（°C）")
 
 
+def _validate_readings_field(value: list["TemperatureReading"]) -> list["TemperatureReading"]:
+    """共用的读数列表校验：全部带时区、时间严格递增（空列表直接通过）。"""
+    # 延迟导入避免 schema <-> review 顶层循环依赖（review 不依赖 schema，实际不会循环，
+    # 但保持校验消息与算法层一致更稳妥）。
+    from app.review import ensure_reading_times
+
+    ensure_reading_times([item.time for item in value])
+    return value
+
+
 class TimePeriod(BaseModel):
     """一个半开时间区间 [start, end)，维护豁免时段与货物存放窗口用。"""
 
@@ -44,17 +54,7 @@ class ReadingsRequestBase(BaseModel):
     @field_validator("readings")
     @classmethod
     def _check_strictly_increasing(cls, value: list[TemperatureReading]):
-        if not value:
-            return value
-        for item in value:
-            if item.time.tzinfo is None:
-                raise ValueError("每条读数的 time 都必须带时区")
-        prev = value[0].time
-        for item in value[1:]:
-            if item.time <= prev:
-                raise ValueError("读数时间必须严格递增")
-            prev = item.time
-        return value
+        return _validate_readings_field(value)
 
     @field_validator("temperature_limit")
     @classmethod
@@ -145,3 +145,71 @@ class ExposureResponse(BaseModel):
             "within=未达到且窗口内无未知时长"
         ),
     )
+
+
+class ProbeDeviationRequest(BaseModel):
+    """双探头（主、备）温度偏差复核请求。"""
+
+    primary_readings: list[TemperatureReading] = Field(
+        ..., min_length=2, description="主探头温度读数，时间必须带时区且严格递增"
+    )
+    backup_readings: list[TemperatureReading] = Field(
+        ..., min_length=2, description="备探头温度读数，时间必须带时区且严格递增"
+    )
+    primary_max_sample_gap_seconds: float = Field(
+        ..., gt=0, description="主探头允许的最大相邻采样间隔（秒），超过即视为采样断档"
+    )
+    backup_max_sample_gap_seconds: float = Field(
+        ..., gt=0, description="备探头允许的最大相邻采样间隔（秒），超过即视为采样断档"
+    )
+    allowed_temperature_difference: float = Field(
+        ...,
+        ge=0,
+        description="允许温差（°C），非负；两侧绝对温差严格大于该值才算偏差",
+    )
+    min_deviation_seconds: float = Field(
+        ..., ge=0, description="最短偏差时长（秒），连续偏差达到该时长才输出（含等号）"
+    )
+
+    @field_validator("primary_readings", "backup_readings")
+    @classmethod
+    def _check_readings(cls, value: list[TemperatureReading]):
+        return _validate_readings_field(value)
+
+    @field_validator("allowed_temperature_difference")
+    @classmethod
+    def _check_difference_finite(cls, value: float) -> float:
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("允许温差必须是有限数值")
+        return value
+
+    @model_validator(mode="after")
+    def _check_coverage_overlap(self) -> "ProbeDeviationRequest":
+        # 复用读数校验后两组读数均至少 2 条且严格递增。
+        p_first = self.primary_readings[0].time
+        p_last = self.primary_readings[-1].time
+        b_first = self.backup_readings[0].time
+        b_last = self.backup_readings[-1].time
+        if max(p_first, b_first) >= min(p_last, b_last):
+            raise ValueError("主、备探头读数的覆盖时间必须存在非空交集")
+        return self
+
+
+class ProbeDeviationResponse(BaseModel):
+    """双探头温度偏差复核响应。"""
+
+    deviation_intervals: list[IntervalOut] = Field(
+        default_factory=list,
+        description=(
+            "偏差区间：两侧均有效时线性插值，绝对温差严格大于允许温差的连续区间，"
+            "时长达到最短偏差时长才输出；不跨越未知区间"
+        ),
+    )
+    unknown_intervals: list[IntervalOut] = Field(
+        default_factory=list,
+        description="未知区间：交集中任一侧采样断档覆盖的部分，不插值、不外推",
+    )
+    deviation_seconds: float = Field(..., description="偏差区间总时长（秒）")
+    unknown_seconds: float = Field(..., description="未知区间总时长（秒）")
+    deviation_count: int
+    unknown_count: int
